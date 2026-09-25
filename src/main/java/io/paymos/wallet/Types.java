@@ -21,12 +21,20 @@ public final class Types {
         public final String symbol;
         public final String chain;
         public final int decimals;
+        /**
+         * Lowercase hex sha256 of the raw token id behind this asset, as the server publishes it.
+         * The co-sign checks every disclosed transfer against it unless the label is pinned (see
+         * {@code pinnedFingerprints} on {@link Wallet}). Null from a server too old to publish it:
+         * reads still work, and a co-sign is refused.
+         */
+        public final String fingerprint;
 
         Asset(JsonObject o) {
             this.asset = str(o, "asset");
             this.symbol = str(o, "symbol");
             this.chain = str(o, "chain");
             this.decimals = o != null && o.has("decimals") ? o.get("decimals").getAsInt() : 0;
+            this.fingerprint = strOrNull(o, "fingerprint");
         }
     }
 
@@ -92,7 +100,7 @@ public final class Types {
         }
     }
 
-    /** What arrives. {@code min} is the floor the operation is allowed to deliver, and it is guaranteed. */
+    /** What arrives. {@code min} is the floor the quote commits to; {@code minReceive} is how a caller enforces one. */
     public static final class Receive {
         public final String amount;
         public final String min;

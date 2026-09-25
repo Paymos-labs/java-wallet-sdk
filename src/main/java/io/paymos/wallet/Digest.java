@@ -11,8 +11,8 @@ import java.security.NoSuchAlgorithmException;
  * The exact 32 bytes the vault's signature is computed over — a byte-for-byte port of the Python
  * SDK's digest, which is itself pinned to the server by a cross-language golden vector.
  *
- * <p>The SDK uses this to VERIFY, before a single FROST commitment leaves the process, that the
- * server disclosed the true message it is asking the vault to sign. Never blind-sign.
+ * <p>The SDK uses this to verify, before a share is produced, that the package it is asked to sign
+ * binds to exactly the message the server disclosed — so what is checked is what is signed.
  *
  * <p>digest = sha256 of:
  *   u32   tag                 fixed domain separation; must byte-match the server

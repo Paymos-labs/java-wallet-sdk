@@ -7,8 +7,10 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.util.LinkedHashMap;
 import java.util.Map;
 
+import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 
@@ -22,6 +24,11 @@ import com.google.gson.JsonParser;
  * messages arrive already client-safe, so this layer maps them and never rewrites them, and it
  * never logs or echoes a request body.
  *
+ * <p>A 2xx body is returned as whatever JSON it is: /assets and /balances answer a bare array,
+ * everything else an object, and the caller says which it expects. A body that is not JSON at all
+ * — a proxy's HTML page, a truncated read — is a typed error on either side of 2xx, never a raw
+ * parse exception.
+ *
  * <p>Transport failures are wrapped into a typed error with no status, so a caller on the money
  * path never catches a raw HttpClient exception.
  */
@@ -29,73 +36,110 @@ final class Http {
     /** The sign/aggregate round can trigger a relay that takes a while. */
     private static final Duration DEFAULT_TIMEOUT = Duration.ofSeconds(60);
 
+    /** How much of a non-JSON body an error message quotes. The rest is noise, often a whole page. */
+    private static final int SNIPPET = 200;
+
+    /** What a request looked like on the wire. Tests read it back; nothing else does. */
+    static final class Request {
+        final String method;
+        final String url;
+        final Map<String, String> headers;
+        final String body;
+
+        Request(String method, String url, Map<String, String> headers, String body) {
+            this.method = method;
+            this.url = url;
+            this.headers = headers;
+            this.body = body;
+        }
+    }
+
+    static final class Response {
+        final int status;
+        final String body;
+        final String retryAfter;
+
+        Response(int status, String body, String retryAfter) {
+            this.status = status;
+            this.body = body;
+            this.retryAfter = retryAfter;
+        }
+    }
+
+    /** The one seam under the SDK: the real one is java.net.http, a test's is a fixture file. */
+    interface Transport {
+        Response send(Request request) throws IOException, InterruptedException;
+    }
+
     private final String baseUrl;
     private final String apiKey;
-    private final HttpClient client;
-    private final Duration timeout;
+    private final Transport transport;
 
     Http(String baseUrl, String apiKey, Duration timeout) {
+        this(baseUrl, apiKey, timeout, null);
+    }
+
+    Http(String baseUrl, String apiKey, Duration timeout, Transport transport) {
         this.baseUrl = baseUrl.replaceAll("/+$", "");
         this.apiKey = apiKey;
-        this.timeout = timeout == null ? DEFAULT_TIMEOUT : timeout;
-        this.client = HttpClient.newBuilder()
-            .connectTimeout(this.timeout)
-            .build();
+        this.transport = transport != null ? transport
+            : new JdkTransport(timeout == null ? DEFAULT_TIMEOUT : timeout);
     }
 
-    JsonObject get(String path, Map<String, String> query) {
+    JsonElement get(String path, Map<String, String> query) {
         StringBuilder url = new StringBuilder(baseUrl).append(path);
         if (query != null && !query.isEmpty()) {
-            url.append('?');
+            StringBuilder qs = new StringBuilder();
             query.forEach((k, v) -> {
-                if (v != null)
-                    url.append(encode(k)).append('=').append(encode(v)).append('&');
+                if (v != null) qs.append(qs.length() == 0 ? "" : "&").append(encode(k)).append('=').append(encode(v));
             });
-            url.setLength(url.length() - 1);
+            if (qs.length() > 0) url.append('?').append(qs);
         }
-        HttpRequest req = HttpRequest.newBuilder(URI.create(url.toString()))
-            .timeout(timeout)
-            .header("authorization", "Bearer " + apiKey)
-            .GET()
-            .build();
-        return send(req);
+        return send(new Request("GET", url.toString(), headers(null), null));
     }
 
-    JsonObject post(String path, String jsonBody, Map<String, String> extraHeaders) {
-        HttpRequest.Builder b = HttpRequest.newBuilder(URI.create(baseUrl + path))
-            .timeout(timeout)
-            .header("authorization", "Bearer " + apiKey)
-            .header("content-type", "application/json")
-            .POST(HttpRequest.BodyPublishers.ofString(jsonBody));
-        if (extraHeaders != null) extraHeaders.forEach(b::header);
-        return send(b.build());
+    JsonElement post(String path, String jsonBody, Map<String, String> extraHeaders) {
+        Map<String, String> h = headers(extraHeaders);
+        h.put("content-type", "application/json");
+        return send(new Request("POST", baseUrl + path, h, jsonBody));
     }
 
-    private JsonObject send(HttpRequest req) {
-        HttpResponse<String> resp;
+    private Map<String, String> headers(Map<String, String> extra) {
+        Map<String, String> h = new LinkedHashMap<>();
+        h.put("authorization", "Bearer " + apiKey);
+        if (extra != null) h.putAll(extra);
+        return h;
+    }
+
+    private JsonElement send(Request req) {
+        Response resp;
         try {
-            resp = client.send(req, HttpResponse.BodyHandlers.ofString());
+            resp = transport.send(req);
         } catch (IOException e) {
             throw new PaymosException("transport error: " + e.getMessage());
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             throw new PaymosException("transport error: interrupted");
         }
-        String text = resp.body() == null ? "" : resp.body();
-        JsonObject body = null;
+        String text = resp.body == null ? "" : resp.body;
+        JsonElement body = null;
         try {
-            if (!text.isEmpty()) {
-                var parsed = JsonParser.parseString(text);
-                if (parsed.isJsonObject()) body = parsed.getAsJsonObject();
-            }
+            if (!text.isBlank()) body = JsonParser.parseString(text);
         } catch (Exception ignored) {
             body = null;
         }
-        int status = resp.statusCode();
+        int status = resp.status;
         if (status >= 200 && status < 300) {
-            return body == null ? new JsonObject() : body;
+            // Every 2xx under /vault/ is JSON. One that is not came from something standing in
+            // front of the server, and an empty result built from it would read as "no assets".
+            if (body == null || body.isJsonNull())
+                throw new PaymosException(
+                    "the server answered " + status + " with a body that is not JSON" + snippet(text)
+                        + " — is the base URL pointing at the wallet API?", status);
+            return body;
         }
-        throw raiseFor(status, body, text, resp.headers().firstValue("retry-after").orElse(null));
+        throw raiseFor(status, body != null && body.isJsonObject() ? body.getAsJsonObject() : null,
+            text, resp.retryAfter);
     }
 
     private static String messageOf(JsonObject body, int status, String text) {
@@ -108,7 +152,18 @@ final class Http {
             }
         }
         String trimmed = text.trim();
-        return trimmed.isEmpty() ? "request failed with status " + status : trimmed;
+        if (trimmed.isEmpty()) return "request failed with status " + status;
+        // A proxy's HTML page as an exception message is a screenful of markup that says nothing.
+        if (trimmed.startsWith("<"))
+            return "request failed with status " + status + ": the response is not JSON" + snippet(trimmed)
+                + " — is the base URL pointing at the wallet API?";
+        return trimmed.length() > SNIPPET ? trimmed.substring(0, SNIPPET) + "…" : trimmed;
+    }
+
+    private static String snippet(String text) {
+        String t = text.trim().replaceAll("\\s+", " ");
+        if (t.isEmpty()) return " (empty body)";
+        return " (" + (t.length() > SNIPPET ? t.substring(0, SNIPPET) + "…" : t) + ")";
     }
 
     /** Map a 400's message to a type. First match wins, in this exact order. */
@@ -146,5 +201,27 @@ final class Http {
 
     private static String encode(String s) {
         return java.net.URLEncoder.encode(s, StandardCharsets.UTF_8).replace("+", "%20");
+    }
+
+    /** The production transport: java.net.http, one client per wallet. */
+    private static final class JdkTransport implements Transport {
+        private final HttpClient client;
+        private final Duration timeout;
+
+        JdkTransport(Duration timeout) {
+            this.timeout = timeout;
+            this.client = HttpClient.newBuilder().connectTimeout(timeout).build();
+        }
+
+        @Override
+        public Response send(Request r) throws IOException, InterruptedException {
+            HttpRequest.Builder b = HttpRequest.newBuilder(URI.create(r.url)).timeout(timeout);
+            r.headers.forEach(b::header);
+            if (r.method.equals("POST")) b.POST(HttpRequest.BodyPublishers.ofString(r.body));
+            else b.GET();
+            HttpResponse<String> resp = client.send(b.build(), HttpResponse.BodyHandlers.ofString());
+            return new Response(resp.statusCode(), resp.body(),
+                resp.headers().firstValue("retry-after").orElse(null));
+        }
     }
 }

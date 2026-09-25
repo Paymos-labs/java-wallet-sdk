@@ -94,8 +94,9 @@ either direction. `Amounts.parseUnits` / `Amounts.formatUnits` convert between t
 
 **Moving money.** `swap` and `withdraw` (full key only) create a real movement and drive the
 2-of-2 co-sign. Before any signature the SDK re-checks that the server's quote echoes exactly
-the assets and amount you approved — a decimals bug, contract drift, or a lying server throws
-and **signs nothing**.
+the assets and amount you approved — a decimals bug, contract drift, or a server answering with
+other numbers throws and **signs nothing**. What you typed is pinned; what the server computes
+(the debit of an `exact_out` payout) is bounded only by `maxDebit`.
 
 **Safety caps.** `minReceive` floors the guaranteed receive (`PaymosException.SlippageExceeded`
 below it, nothing signed); `maxDebit` ceilings the total vault debit — strongly recommended for
@@ -134,9 +135,14 @@ read key can never sign.
 - A leaked **API key alone cannot move funds** — no share, no signature (and the key can be
   revoked).
 - A leaked **share alone cannot move funds** — no server co-sign.
-- Both are required, on purpose. The SDK additionally verifies every message it co-signs, and
-  that the server's quote matches exactly what you approved — so a compromised server can't
-  redirect funds or inflate an amount past your caps.
+- Both are required, on purpose. The SDK additionally verifies every message it co-signs — signed
+  from your vault, moving no more than the approved debit, of the token the catalog fingerprints
+  for the send asset — and that the server's quote matches exactly what you approved. A server bug
+  or a subverted signing path gets a refusal.
+- What it does not check: the **recipient** of the transfer. The route's deposit address is chosen
+  by the server and taken as given. The token check trusts the fingerprint the server publishes
+  unless you pin it (below). And for `exact_out` the approved debit is itself server-computed —
+  pass `maxDebit` on unattended payouts.
 
 Treat a full `vs_live_…` secret like a private key, and back up the share — losing it means
 losing your ability to co-sign.
@@ -176,8 +182,15 @@ your half of the signature exists.
 
 No, and this is the part worth reading twice. The server discloses the exact message it wants
 signed; the SDK recomputes the digest itself and refuses unless that message belongs to your vault,
-moves no more than the debit you approved, and matches the request you made. A server asking for
-anything else gets a refusal, not a signature.
+moves no more than the approved debit, and moves the token whose fingerprint `/assets` publishes for
+the send asset. It does not check where the transfer goes: the route's deposit address is chosen
+by the server. For `exact_out` the debit is server-computed too, so cap it with `maxDebit`.
+
+That fingerprint comes from the same server that builds the messages, so on its own it catches a
+bug or a compromised signing path, not a server compromised end to end. To anchor the token
+independently, pin the fingerprints out of band — the lowercase hex SHA-256 of each raw token id:
+`new Wallet(secret, null, null, Map.of("USDC@base", List.of("a42c7e46…")))`. A pinned label is
+checked only against your pins, whatever `/assets` says; unpinned labels use the published set.
 
 ### Which networks and assets are supported?
 

@@ -7,7 +7,7 @@
   <groupId>io.paymos</groupId>
   <artifactId>wallet</artifactId>
   <!-- Stamped by the release workflow; nobody edits this by hand. -->
-  <version>1.0.0</version>
+  <version>1.0.1</version>
   <packaging>jar</packaging>
 
   <name>paymos-wallet</name>

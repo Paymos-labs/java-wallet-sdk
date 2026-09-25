@@ -47,8 +47,9 @@ class HttpTest {
 
     @Test
     void returnsParsedJsonOn2xx() throws IOException {
+        // The real shape: /assets answers a bare array, never {"assets": [...]}.
         Wallet w = walletOver(200,
-            "{\"assets\":[{\"asset\":\"USDC@base\",\"symbol\":\"USDC\",\"chain\":\"base\",\"decimals\":6}]}");
+            "[{\"asset\":\"USDC@base\",\"symbol\":\"USDC\",\"chain\":\"base\",\"decimals\":6}]");
         var assets = w.assets();
         assertEquals(1, assets.size());
         assertEquals("USDC@base", assets.get(0).asset);
@@ -121,14 +122,14 @@ class HttpTest {
             String path = exchange.getRequestURI().getPath();
             String body;
             if (path.equals("/vault/v1/assets")) {
-                body = "{\"assets\":[{\"asset\":\"USDC@base\",\"symbol\":\"USDC\",\"chain\":\"base\",\"decimals\":6}]}";
+                body = "[{\"asset\":\"USDC@base\",\"symbol\":\"USDC\",\"chain\":\"base\",\"decimals\":6}]";
             } else if (path.equals("/vault/v1/quote/withdraw")) {
                 // A deliberately wrong asset: the echo check fails AFTER the request was seen.
                 body = "{\"movement_id\":\"m1\",\"mode\":\"exact_out\","
                     + "\"send\":{\"amount\":\"24000000\",\"asset\":\"OTHER\"},"
                     + "\"debit\":{\"amount\":\"25000000\",\"asset\":\"USDC@base\"},"
                     + "\"receive\":{\"amount\":\"25000000\",\"min\":\"25000000\",\"asset\":\"USDC@base\"},"
-                    + "\"fees\":null,\"expires_at\":\"\",\"sources\":1}";
+                    + "\"expires_at\":\"\",\"sources\":1}";
             } else {
                 body = "{}";
             }
