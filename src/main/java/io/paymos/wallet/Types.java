@@ -7,10 +7,15 @@ import com.google.gson.JsonObject;
 /**
  * The read model, ported field-for-field from the Python SDK.
  *
- * <p>Every amount is a STRING of raw integer units, never a number. A token with 18 decimals runs
- * past what a double holds exactly, so a JSON parser that produced numbers here would round
- * somebody's balance without saying so. Use {@link Amounts#formatUnits} to show one and
- * {@link Amounts#parseUnits} to build one.
+ * <p>Every amount IN THESE RESPONSE TYPES is a STRING of raw integer units, never a number. A
+ * token with 18 decimals runs past what a double holds exactly, so a JSON parser that produced
+ * numbers here would round somebody's balance without saying so. {@link Amounts#formatUnits}
+ * shows one as a human decimal; {@link Amounts#parseUnits} turns a human figure into raw units to
+ * COMPARE with one.
+ *
+ * <p>The amounts you PASS to {@link Wallet} are the other way round: human decimal strings
+ * ("100", "0.5"), which the server scales. Never pass the output of parseUnits there — "10000"
+ * meant as 0.01 USDC is read as 10 000 USDC.
  */
 public final class Types {
     private Types() {}

@@ -1,6 +1,5 @@
 package io.paymos.wallet;
 
-import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.net.URI;
@@ -14,6 +13,7 @@ import java.nio.file.Paths;
 import java.nio.file.StandardCopyOption;
 import java.security.MessageDigest;
 import java.util.Locale;
+import java.util.Map;
 import java.util.zip.GZIPInputStream;
 
 import com.google.gson.JsonObject;
@@ -33,20 +33,55 @@ import com.sun.jna.Pointer;
  * server-side operations and are deliberately absent from the public surface.
  *
  * <p>The binary comes from three places, in this order:
- *   1. {@code PAYMOS_NATIVE_LIB} — a full path to a local binary. The offline escape hatch.
+ *   1. {@code PAYMOS_NATIVE_LIB} — a full path to a local binary. The offline escape hatch, and
+ *      the operator's own choice: no hash below applies to it.
  *   2. The per-user cache, where a previous run already left a verified binary.
- *   3. The paymos-wallet-core GitHub release — downloaded, SHA-256-checked against the release's
- *      checksum file, then cached. A mismatch refuses: a substituted binary never crosses the
- *      FFI boundary.
- * Whatever the source, the loaded binary must self-report the version this SDK is pinned to
+ *   3. The paymos-wallet-core GitHub release — downloaded, verified, then cached.
+ *
+ * <p>How a download and a cached file are verified depends on {@link #PINNED_CORE_SHA256}. With an
+ * entry for this version and platform, that compiled-in hash is the ONLY one accepted: the
+ * release's own .sha256 is not even fetched, the library extracted from the archive must hash to
+ * the pin before it is written, and the cached file is re-hashed against it on every load — a
+ * mismatch anywhere refuses, and nothing crosses the FFI boundary. Without an entry, the archive is
+ * checked against the .sha256 published beside it in the same release, which catches a corrupted
+ * download but not a replaced release, and a cached file is trusted as written.
+ *
+ * <p>Whatever the source, the loaded binary must self-report the version this SDK is pinned to
  * (fail-closed), and only then do its exports serve calls.
  */
 public final class NativeCore {
     /** The paymos-wallet-core release this SDK build is pinned to. Bump when the core releases. */
     public static final String CORE_VERSION = "0.1.0";
 
+    /**
+     * Core version → platform ("linux-x64", "linux-arm64", "win-x64", "win-arm64", "osx-x64",
+     * "osx-arm64") → the lowercase hex SHA-256 of the LIBRARY FILE inside
+     * paymos-wallet-native-v&lt;version&gt;-&lt;platform&gt;.tar.gz — libwallet_mpc.so,
+     * wallet_mpc.dll or libwallet_mpc.dylib as extracted, not the archive. Empty in this build: until
+     * it is filled, a download is checked only against the release's own .sha256. Fill it from a
+     * build you trust; the Go, C#, PHP and Ruby SDKs carry the same table.
+     */
+    static final Map<String, Map<String, String>> PINNED_CORE_SHA256 = Map.of(
+        // "0.1.0", Map.of(
+        //     "linux-x64", "<sha256 of libwallet_mpc.so>",
+        //     "linux-arm64", "<sha256 of libwallet_mpc.so>",
+        //     "win-x64", "<sha256 of wallet_mpc.dll>")
+    );
+
     private static final String RELEASE_BASE =
         "https://github.com/paymos-labs/paymos-wallet-core/releases/download";
+
+    /**
+     * The archive holds one library of about a megabyte. These bounds stop a replaced release from
+     * spending the integrator's memory on a huge download or a decompression bomb.
+     */
+    static final long MAX_ARCHIVE_BYTES = 64L << 20;
+    static final long MAX_LIBRARY_BYTES = 64L << 20;
+
+    /** Fetches a URL, refusing a body over the limit. The tests hand in a stand-in release. */
+    interface Downloader {
+        byte[] get(String url, long limit);
+    }
 
     private static Function mpcCall;
     private static Function mpcFree;
@@ -154,17 +189,79 @@ public final class NativeCore {
             return p;
         }
 
-        Path cacheDir = cacheRoot().resolve("v" + CORE_VERSION).resolve(rid);
-        Path cached = cacheDir.resolve(libName(rid));
-        if (Files.exists(cached)) return cached;
+        return resolveCachedOrDownloaded(cacheRoot(), rid, CORE_VERSION, RELEASE_BASE, NativeCore::download,
+            PINNED_CORE_SHA256);
+    }
 
-        String archiveName = "paymos-wallet-native-v" + CORE_VERSION + "-" + rid + ".tar.gz";
-        byte[] archive = download(RELEASE_BASE + "/v" + CORE_VERSION + "/" + archiveName);
-        String checksum = new String(
-            download(RELEASE_BASE + "/v" + CORE_VERSION + "/" + archiveName + ".sha256"), StandardCharsets.UTF_8);
-        verifySha256(archive, checksum, archiveName);
-        extractSingleFileTarGz(archive, cached);
+    /** The compiled-in hash for {@code version} on {@code rid}, lowercased, or null. */
+    static String pinnedHash(Map<String, Map<String, String>> pins, String version, String rid) {
+        Map<String, String> byRid = pins.get(version);
+        String hash = byRid == null ? null : byRid.get(rid);
+        if (hash == null || hash.isBlank()) return null;
+        return hash.trim().toLowerCase(Locale.ROOT);
+    }
+
+    /**
+     * The cached core for {@code rid}, downloading and installing it first when there is none —
+     * verified against {@code pins} when they cover the platform (and then re-hashed on every
+     * call), otherwise against the release's own checksum. Package-private and parameterised so
+     * the tests can drive it without a network.
+     */
+    static Path resolveCachedOrDownloaded(Path cacheRoot, String rid, String version, String releaseBase,
+                                          Downloader download, Map<String, Map<String, String>> pins) {
+        Path cached = cacheRoot.resolve("v" + version).resolve(rid).resolve(libName(rid));
+        String pinned = pinnedHash(pins, version, rid);
+
+        if (!Files.exists(cached)) {
+            String archiveName = "paymos-wallet-native-v" + version + "-" + rid + ".tar.gz";
+            byte[] archive = download.get(releaseBase + "/v" + version + "/" + archiveName, MAX_ARCHIVE_BYTES);
+            if (pinned == null) {
+                // No compiled-in hash: the release's own checksum, which proves the download intact
+                // and nothing more.
+                String checksum = new String(
+                    download.get(releaseBase + "/v" + version + "/" + archiveName + ".sha256", 4096), StandardCharsets.UTF_8);
+                verifySha256(archive, checksum, archiveName);
+            }
+            byte[] library = readSingleFileTarGz(archive, MAX_LIBRARY_BYTES);
+            if (pinned != null) checkPinned(library, pinned, archiveName); // refused before a byte is written
+            install(library, cached);
+        }
+
+        // A pinned core is re-hashed on every load, cached or just installed: the cache is only a
+        // file on disk, and the pin is the only thing that says what may run.
+        if (pinned != null) {
+            byte[] onDisk;
+            try {
+                onDisk = Files.readAllBytes(cached);
+            } catch (IOException e) {
+                throw new PaymosException("cannot read the cached co-signing core " + cached + ": " + e.getMessage());
+            }
+            try {
+                checkPinned(onDisk, pinned, cached.toString());
+            } catch (PaymosException e) {
+                throw new PaymosException(e.getMessage() + ". Nothing was loaded; delete " + cached
+                    + " to fetch the core again — the download is held to the same hash.");
+            }
+        }
         return cached;
+    }
+
+    private static void checkPinned(byte[] payload, String want, String what) {
+        String got = sha256Hex(payload);
+        if (!got.equals(want))
+            throw new PaymosException("SHA-256 mismatch for " + what + ": this SDK pins " + want + ", got " + got);
+    }
+
+    private static String sha256Hex(byte[] payload) {
+        try {
+            byte[] digest = MessageDigest.getInstance("SHA-256").digest(payload);
+            StringBuilder sb = new StringBuilder(64);
+            for (byte b : digest)
+                sb.append(Character.forDigit((b >> 4) & 0xF, 16)).append(Character.forDigit(b & 0xF, 16));
+            return sb.toString();
+        } catch (java.security.NoSuchAlgorithmException e) {
+            throw new IllegalStateException("SHA-256 missing from this JVM", e);
+        }
     }
 
     private static String currentRid() {
@@ -208,18 +305,24 @@ public final class NativeCore {
         return Paths.get(base, "paymos", "native");
     }
 
-    private static byte[] download(String url) {
+    private static byte[] download(String url, long limit) {
         try {
             HttpClient client = HttpClient.newBuilder()
                 .followRedirects(HttpClient.Redirect.NORMAL) // GitHub releases redirect to a CDN
                 .build();
-            HttpResponse<byte[]> resp = client.send(
-                HttpRequest.newBuilder(URI.create(url)).build(), HttpResponse.BodyHandlers.ofByteArray());
-            if (resp.statusCode() != 200)
-                throw new PaymosException(
-                    "failed to download the co-signing core: " + url + " answered " + resp.statusCode() + ". "
-                        + "Set PAYMOS_NATIVE_LIB to a local libwallet_mpc build to run offline");
-            return resp.body();
+            HttpResponse<InputStream> resp = client.send(
+                HttpRequest.newBuilder(URI.create(url)).build(), HttpResponse.BodyHandlers.ofInputStream());
+            try (InputStream body = resp.body()) {
+                if (resp.statusCode() != 200)
+                    throw new PaymosException(
+                        "failed to download the co-signing core: " + url + " answered " + resp.statusCode() + ". "
+                            + "Set PAYMOS_NATIVE_LIB to a local libwallet_mpc build to run offline");
+                byte[] bytes = body.readNBytes((int) Math.min(Integer.MAX_VALUE - 8, limit + 1));
+                if (bytes.length > limit)
+                    throw new PaymosException(
+                        "failed to download the co-signing core: " + url + " is over " + limit + " bytes — refusing it");
+                return bytes;
+            }
         } catch (PaymosException e) {
             throw e;
         } catch (IOException e) {
@@ -252,37 +355,48 @@ public final class NativeCore {
         }
     }
 
-    // Minimal tar reader for our own single-file archives (ustar, type '0'), over GZIP.
-    private static void extractSingleFileTarGz(byte[] archive, Path destination) {
+    /**
+     * The first regular file of one of our own single-file archives (ustar, type '0', over GZIP),
+     * refused once it — or the tar around it — decompresses past {@code limit}.
+     */
+    static byte[] readSingleFileTarGz(byte[] archive, long limit) {
+        // A tar header per file and two zero blocks at the end: 64 KiB is room to spare.
+        long tarLimit = limit + 65536;
         byte[] tar;
-        try (InputStream gz = new GZIPInputStream(new java.io.ByteArrayInputStream(archive));
-             ByteArrayOutputStream out = new ByteArrayOutputStream()) {
-            gz.transferTo(out);
-            tar = out.toByteArray();
+        try (InputStream gz = new GZIPInputStream(new java.io.ByteArrayInputStream(archive))) {
+            tar = gz.readNBytes((int) Math.min(Integer.MAX_VALUE - 8, tarLimit + 1));
         } catch (IOException e) {
             throw new PaymosException("the downloaded core archive is not gzip: " + e.getMessage());
         }
+        if (tar.length > tarLimit)
+            throw new PaymosException("the downloaded core archive holds a file over " + limit + " bytes — refusing to install it");
 
         int offset = 0;
         while (offset + 512 <= tar.length) {
             if (isZeroBlock(tar, offset)) break;
-            int size = (int) readOctal(tar, offset + 124, 12);
+            long size = readOctal(tar, offset + 124, 12);
             char type = (char) tar[offset + 156];
-            if (type == '0' || type == '\0') {
-                try {
-                    Files.createDirectories(destination.getParent());
-                    Path tmp = destination.resolveSibling(destination.getFileName() + ".tmp");
-                    Files.write(tmp, java.util.Arrays.copyOfRange(tar, offset + 512, offset + 512 + size));
-                    Files.move(tmp, destination, StandardCopyOption.REPLACE_EXISTING);
-                    destination.toFile().setExecutable(true);
-                    return;
-                } catch (IOException e) {
-                    throw new PaymosException("cannot install the co-signing core: " + e.getMessage());
-                }
-            }
-            offset += 512 + ((size + 511) / 512) * 512;
+            if (size > limit || offset + 512 + size > tar.length)
+                throw new PaymosException("the downloaded core archive holds a file over " + limit
+                    + " bytes, or a truncated one — refusing to install it");
+            if (type == '0' || type == '\0')
+                return java.util.Arrays.copyOfRange(tar, offset + 512, offset + 512 + (int) size);
+            offset += 512 + (int) ((size + 511) / 512) * 512;
         }
         throw new PaymosException("the downloaded core archive carried no file — refusing to install it");
+    }
+
+    /** Writes the library through a temporary file, so a reader never meets half of it. */
+    private static void install(byte[] library, Path destination) {
+        try {
+            Files.createDirectories(destination.getParent());
+            Path tmp = destination.resolveSibling(destination.getFileName() + ".tmp");
+            Files.write(tmp, library);
+            Files.move(tmp, destination, StandardCopyOption.REPLACE_EXISTING);
+            destination.toFile().setExecutable(true);
+        } catch (IOException e) {
+            throw new PaymosException("cannot install the co-signing core: " + e.getMessage());
+        }
     }
 
     private static boolean isZeroBlock(byte[] b, int offset) {

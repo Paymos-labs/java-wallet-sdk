@@ -72,8 +72,8 @@ final class Http {
     }
 
     private final String baseUrl;
-    private final String apiKey;
-    private final Transport transport;
+    private final transient String apiKey; // transient: no reflective serializer prints it
+    private final transient Transport transport;
 
     Http(String baseUrl, String apiKey, Duration timeout) {
         this(baseUrl, apiKey, timeout, null);

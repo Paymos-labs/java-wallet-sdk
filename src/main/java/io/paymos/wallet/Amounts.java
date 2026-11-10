@@ -12,7 +12,14 @@ package io.paymos.wallet;
 public final class Amounts {
     private Amounts() {}
 
-    /** "1.5", 6 → "1500000". Throws on anything that is not a non-negative decimal. */
+    /**
+     * "1.5", 6 → "1500000". Throws on anything that is not a non-negative decimal.
+     *
+     * <p>For comparing a human figure with a raw amount from a response — never for building the
+     * amount of a quote, swap or withdraw, or a minReceive / maxDebit: those take the human string
+     * itself and the server scales it. {@code withdraw("USDC@base", "10000", …)} — what
+     * {@code parseUnits("0.01", 6)} returns — pays out 10 000 USDC.
+     */
     public static String parseUnits(String human, int decimals) {
         if (decimals < 0) throw new PaymosException("decimals must be >= 0");
         String s = human == null ? "" : human.trim();
@@ -34,7 +41,7 @@ public final class Amounts {
         return stripLeadingZeros(raw.toString());
     }
 
-    /** "1500000", 6 → "1.5". Trailing zeros in the fraction are dropped. */
+    /** "1500000", 6 → "1.5": a raw amount from a response, as a human decimal. Trailing zeros in the fraction are dropped. */
     public static String formatUnits(String raw, int decimals) {
         if (raw == null || raw.isEmpty()) throw new PaymosException("not a raw integer amount: " + raw);
         String sign = "";

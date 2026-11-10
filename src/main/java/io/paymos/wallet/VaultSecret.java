@@ -10,14 +10,19 @@ import com.google.gson.JsonParser;
  * The "vs_live_…" vault secret: an API key, the vault id, and — for a full key — this side's
  * FROST signing share. Ported from the Python SDK, same envelope, same field names, so one
  * secret works with any of the SDKs.
+ *
+ * <p>{@link #toString} masks the key and omits the share, and both fields are {@code transient},
+ * which a serializer handed the object — a structured logger, an object dumped to JSON — skips:
+ * Gson by default, and Jackson, which does not detect a transient field as a property. The fields
+ * stay readable; {@link #pack} is how a secret is stored.
  */
 public final class VaultSecret {
     private static final String PREFIX = "vs_live_";
 
-    public final String apiKey;
+    public final transient String apiKey;
     public final long vaultId;
     /** This side's FROST key package JSON. Null on a read-only secret. Never rendered. */
-    public final String share;
+    public final transient String share;
 
     private VaultSecret(String apiKey, long vaultId, String share) {
         this.apiKey = apiKey;

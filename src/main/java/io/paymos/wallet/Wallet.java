@@ -69,8 +69,10 @@ public final class Wallet {
 
     private static final String DEFAULT_BASE_URL = "https://wallet.paymos.io";
 
-    private final VaultSecret secret;
-    private final Http http;
+    // transient: a reflective serializer handed the wallet (Gson, a logger's JSON layout) skips the
+    // secret and the transport, which carries the API key.
+    private final transient VaultSecret secret;
+    private final transient Http http;
     private volatile List<Asset> catalogCache;
     private volatile Map<String, Asset> assetCache;
     /** label → lowercase fingerprints the caller pinned. A pinned label ignores what /assets says. */
@@ -182,14 +184,26 @@ public final class Wallet {
 
     // ── quotes ───────────────────────────────────────────────────────────────
 
-    /** A dry preview. Nothing is created and nothing is signed. */
+    /**
+     * A dry preview. Nothing is created and nothing is signed.
+     *
+     * <p>{@code amount} is a HUMAN decimal string in the send asset ("100", "0.5"); the server
+     * scales it by the asset's decimals. The quote comes back in raw integer strings. Never pass
+     * {@link Amounts#parseUnits} output here: "10000" is ten thousand of the asset, not 0.01.
+     */
     public Quote quoteSwap(String send, String receive, String amount, int slippageBps) {
         validateAmount(amount, send);
         decimalsOf(receive);
         return quote("/vault/v1/quote/swap", swapBody(send, receive, amount, slippageBps), true, null);
     }
 
-    /** A dry preview. Nothing is created and nothing is signed. */
+    /**
+     * A dry preview. Nothing is created and nothing is signed.
+     *
+     * <p>{@code amount} is a HUMAN decimal string in {@code asset} ("25", "0.01"); the server scales
+     * it. The quote comes back in raw integer strings. Never pass {@link Amounts#parseUnits} output
+     * here.
+     */
     public Quote quoteWithdraw(String asset, String amount, String to, String mode) {
         validateAmount(amount, asset);
         JsonObject body = new JsonObject();
@@ -202,15 +216,26 @@ public final class Wallet {
 
     // ── money ────────────────────────────────────────────────────────────────
 
-    /** Full-key secrets only. Creates a real movement and drives the 2-of-2 co-sign. */
+    /**
+     * Full-key secrets only. Creates a real movement and drives the 2-of-2 co-sign.
+     *
+     * <p>{@code amount}, {@code minReceive} and {@code maxDebit} are HUMAN decimal strings ("100",
+     * "99.5") that the server scales by each asset's decimals — never {@link Amounts#parseUnits}
+     * output, which would be read as that many whole units: {@code swap("USDC@base", "USDT@base",
+     * "10000", …)} swaps ten thousand USDC.
+     *
+     * <p>{@code idempotencyKey}: a durable key (a payout or job id) under which a retry replays the
+     * same movement; null gets a fresh key per call, so a retry is a new payment. An empty or blank
+     * key is refused.
+     */
     public Movement swap(String send, String receive, String amount, int slippageBps,
                          String minReceive, String maxDebit, String idempotencyKey) {
         requireShare("swap");
+        String key = idempotencyKeyOf(idempotencyKey);
         int sendDec = validateAmount(amount, send);
         int recvDec = decimalsOf(receive);
 
-        Quote q = quote("/vault/v1/quote/swap", swapBody(send, receive, amount, slippageBps), false,
-            idempotencyKey == null || idempotencyKey.isEmpty() ? freshIdempotencyKey() : idempotencyKey);
+        Quote q = quote("/vault/v1/quote/swap", swapBody(send, receive, amount, slippageBps), false, key);
 
         if (minReceive != null && !minReceive.isEmpty()) {
             BigInteger floor = new BigInteger(Amounts.parseUnits(minReceive, recvDec));
@@ -226,10 +251,23 @@ public final class Wallet {
         return movement(requireMovementId(q));
     }
 
-    /** Full-key secrets only. Creates a real payout movement and drives the 2-of-2 co-sign. */
+    /**
+     * Full-key secrets only. Creates a real payout movement and drives the 2-of-2 co-sign.
+     *
+     * <p>{@code amount} and {@code maxDebit} are HUMAN decimal strings ("25", "0.01") that the
+     * server scales by the asset's decimals — never {@link Amounts#parseUnits} output.
+     * {@code withdraw("USDC@base", "10000", …)}, which is what {@code parseUnits("0.01", 6)}
+     * returns, pays out ten thousand USDC; the SDK and the server agree on that number, so no check
+     * can tell it from an intended one.
+     *
+     * <p>{@code idempotencyKey}: a durable key (a payout or job id) under which a retry replays the
+     * same movement; null gets a fresh key per call, so a retry is a new payment. An empty or blank
+     * key is refused.
+     */
     public Movement withdraw(String asset, String amount, String to, String mode,
                              String maxDebit, String idempotencyKey) {
         requireShare("withdraw");
+        String key = idempotencyKeyOf(idempotencyKey);
         int dec = validateAmount(amount, asset);
         if (mode == null || mode.isEmpty()) mode = "exact_out";
 
@@ -238,8 +276,7 @@ public final class Wallet {
         body.addProperty("amount", amount);
         body.addProperty("to", to);
         body.addProperty("mode", mode);
-        Quote q = quote("/vault/v1/quote/withdraw", body, false,
-            idempotencyKey == null || idempotencyKey.isEmpty() ? freshIdempotencyKey() : idempotencyKey);
+        Quote q = quote("/vault/v1/quote/withdraw", body, false, key);
 
         // A withdraw is same-asset. For exact_out the approved amount is the guaranteed OUT; for
         // total_in it is the total DEBIT — and the send leg is total minus fees, so pinning send
@@ -450,6 +487,19 @@ public final class Wallet {
         }
     }
 
+    /**
+     * The key a money call is sent under: the caller's, or a fresh one when they passed null. An
+     * empty or blank key is refused. It used to be swapped for a fresh random key, so a retry
+     * carried a different key and paid again while the caller believed it was deduplicated.
+     */
+    private static String idempotencyKeyOf(String key) {
+        if (key == null) return freshIdempotencyKey();
+        if (key.isBlank())
+            throw new PaymosException("idempotencyKey is empty — pass a durable key (a payout or job id) so a retry "
+                + "replays the same movement, or pass null for a fresh one per call");
+        return key;
+    }
+
     private static String freshIdempotencyKey() {
         byte[] b = new byte[16];
         new SecureRandom().nextBytes(b);
@@ -596,10 +646,12 @@ public final class Wallet {
             throw new PaymosException(
                 "co-sign refused: signing package " + i + " does not bind to the disclosed message");
 
-        // (2) structure and own-vault: one transfer, signed from this vault and no other.
+        // (2) structure and own-vault: one transfer, signed from this vault and no other. Parsed
+        // strictly (StrictJson): the verifier on chain re-parses these exact bytes as RFC JSON and
+        // rejects a repeated key, where JsonParser is lenient and keeps the last one.
         JsonObject parsed;
         try {
-            parsed = JsonParser.parseString(message).getAsJsonObject();
+            parsed = StrictJson.parse(message).getAsJsonObject();
         } catch (Exception e) {
             throw new PaymosException("co-sign refused: unreadable message for source " + i + ": " + e.getMessage());
         }

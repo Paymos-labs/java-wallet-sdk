@@ -277,6 +277,58 @@ class CosignTest {
         }
     }
 
+    @Test
+    void refusesAMessageThatRepeatsAKey() {
+        // Read the way JsonParser reads — last key wins — each of these is one transfer inside the
+        // debit. The verifier on chain rejects a repeated key; the guard refuses the message.
+        String real = "{\"intent\":\"transfer\",\"tokens\":{\"usdc-base\":\"5000000000\"}}";
+        String decoy = "{\"intent\":\"transfer\",\"tokens\":{\"usdc-base\":\"1\"}}";
+        for (String msg : new String[] {
+                "{\"signer_id\":\"" + vk + "\",\"intents\":[" + real + "],\"intents\":[" + decoy + "]}",
+                "{\"signer_id\":\"" + vk + "\",\"intents\":[" + real + "],\"\\u0069ntents\":[" + decoy + "]}",
+                "{\"signer_id\":\"" + vk + "\",\"intents\":[{\"intent\":\"transfer\",\"tokens\":"
+                    + "{\"usdc-base\":\"5000000000\",\"usdc-base\":\"1\"}}]}",
+                "{\"signer_id\":\"someone-else\",\"intents\":[" + decoy + "],\"signer_id\":\"" + vk + "\"}" }) {
+            assertEquals(1, JsonParser.parseString(msg).getAsJsonObject().getAsJsonArray("intents").size());
+            Server s = new Server("quote_swap", 1);
+            s.message = (i, amount) -> msg;
+            refused(s, "duplicate key");
+        }
+    }
+
+    @Test
+    void refusesAMessageThatIsNotStrictJson() {
+        // JsonParser is lenient and reads every one of these; a strict reader — the verifier's —
+        // reads none of them.
+        String intents = "\"intents\":[{\"intent\":\"transfer\",\"tokens\":{\"usdc-base\":\"1\"}}]";
+        for (String msg : new String[] {
+                "{signer_id:\"" + vk + "\"," + intents + "}",
+                "{'signer_id':'" + vk + "'," + intents + "}",
+                "{\"signer_id\":\"" + vk + "\",/* a comment */" + intents + "}",
+                "{\"signer_id\":" + vk + "," + intents + "}",
+                "{\"signer_id\":\"" + vk + "\";" + intents + "}" }) {
+            assertDoesNotThrow(() -> JsonParser.parseString(msg), msg);
+            Server s = new Server("quote_swap", 1);
+            s.message = (i, amount) -> msg;
+            refused(s, "unreadable message");
+        }
+    }
+
+    @Test
+    void refusesAMessageNestedPastTheLimitAndSignsAnOrdinaryOne() {
+        String intents = "\"intents\":[{\"intent\":\"transfer\",\"tokens\":{\"usdc-base\":\"1\"}}]";
+        Server deep = new Server("quote_swap", 1);
+        deep.message = (i, amount) -> "{\"signer_id\":\"" + vk + "\"," + intents + ",\"memo\":"
+            + "[".repeat(100_000) + "]".repeat(100_000) + "}";
+        refused(deep, "nested deeper than 64 levels");
+
+        Server ordinary = new Server("quote_swap", 1);
+        ordinary.message = (i, amount) -> "{\"signer_id\":\"" + vk + "\"," + intents + ",\"memo\":"
+            + "[".repeat(8) + "]".repeat(8) + "}";
+        ordinary.wallet().swap("USDC@base", "USDT@base", "5", 50, null, null, null);
+        assertEquals(1, ordinary.aggregateCalls);
+    }
+
     static String sha256(String s) {
         try {
             return hex(java.security.MessageDigest.getInstance("SHA-256").digest(s.getBytes(java.nio.charset.StandardCharsets.UTF_8)));
